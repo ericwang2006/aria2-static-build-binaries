@@ -1,0 +1,198 @@
+name: Build Aria2 Static Binaries
+
+on:
+  workflow_dispatch:              # 允许在GitHub界面手动触发
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Clone aria2-static-build repository
+      run: |
+        git clone https://github.com/abcfy2/aria2-static-build.git
+        cd aria2-static-build
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Create build script
+      run: |
+        cd aria2-static-build
+        cat > cross_build.sh << 'SCRIPT_EOF'
+        #!/bin/bash
+        set -e
+        
+        # 修改build.sh文件
+        sed -i '/if \[ ! -f \.\/configure \]; then/,/fi/{
+        /if \[ ! -f \.\/configure \]; then/{
+        r /dev/stdin
+        d
+        }
+        /autoreconf -i/d
+        /fi/d
+        }' build.sh << 'EOF'
+          if [ ! -f ./configure ]; then
+            sed -i 's/"1", 1, 16/"128", 1, -1/g' ./src/OptionHandlerFactory.cc
+            sed -i 's/"20M", 1_m, 1_g/"4K", 1_k, 1_g/g' ./src/OptionHandlerFactory.cc
+            sed -i 's/PREF_CONNECT_TIMEOUT, TEXT_CONNECT_TIMEOUT, "60", 1, 600/PREF_CONNECT_TIMEOUT, TEXT_CONNECT_TIMEOUT, "30", 1, 600/g' ./src/OptionHandlerFactory.cc
+            sed -i 's/PREF_PIECE_LENGTH, TEXT_PIECE_LENGTH, "1M", 1_m, 1_g/PREF_PIECE_LENGTH, TEXT_PIECE_LENGTH, "4k", 1_k, 1_g/g' ./src/OptionHandlerFactory.cc
+            sed -i 's/new NumberOptionHandler(PREF_RETRY_WAIT, TEXT_RETRY_WAIT, "0", 0, 600/new NumberOptionHandler(PREF_RETRY_WAIT, TEXT_RETRY_WAIT, "2", 0, 600/g' ./src/OptionHandlerFactory.cc
+            sed -i 's/new NumberOptionHandler(PREF_SPLIT, TEXT_SPLIT, "5", 1, -1,/new NumberOptionHandler(PREF_SPLIT, TEXT_SPLIT, "8", 1, -1,/g' ./src/OptionHandlerFactory.cc
+            autoreconf -i
+          fi
+        EOF
+        
+        # 配置
+        DOCKER_IMAGE="abcfy2/musl-cross-toolchain-ubuntu"
+        BUILD_SCRIPT="/build/build.sh"
+        DIST_DIR="dist"
+        PWD_MOUNT="$(pwd)"
+        
+        # 颜色输出
+        RED='\033[0;31m'
+        GREEN='\033[0;32m'
+        YELLOW='\033[1;33m'
+        NC='\033[0m' # No Color
+        
+        # 日志函数
+        log_info() {
+            echo -e "${GREEN}[INFO]${NC} $1"
+        }
+        
+        log_warn() {
+            echo -e "${YELLOW}[WARN]${NC} $1"
+        }
+        
+        log_error() {
+            echo -e "${RED}[ERROR]${NC} $1"
+        }
+        
+        # 清理函数
+        cleanup() {
+            log_info "清理临时文件..."
+            rm -f ./aria2c ./aria2c.exe 2>/dev/null || true
+        }
+        
+        # 注册清理函数
+        trap cleanup EXIT INT TERM
+        
+        # 构建函数
+        build_target() {
+            local cross_host="$1"
+            local output_name="$2"
+            local source_file="$3"
+            
+            log_info "开始构建目标: $cross_host -> $output_name"
+            
+            # 检查Docker镜像是否存在
+            if ! docker image inspect "${DOCKER_IMAGE}:${cross_host}" &>/dev/null; then
+                log_warn "Docker镜像 ${DOCKER_IMAGE}:${cross_host} 不存在，尝试拉取..."
+                if ! docker pull "${DOCKER_IMAGE}:${cross_host}"; then
+                    log_error "无法拉取镜像 ${DOCKER_IMAGE}:${cross_host}"
+                    return 1
+                fi
+            fi
+            
+            # 运行Docker构建
+            if docker run --rm \
+                -v "${PWD_MOUNT}:/build" \
+                -e CROSS_HOST="${cross_host}" \
+                "${DOCKER_IMAGE}:${cross_host}" \
+                "${BUILD_SCRIPT}"; then
+                
+                # 检查源文件是否存在
+                if [[ -f "./${source_file}" ]]; then
+                    local tar_name="${DIST_DIR}/${output_name}.tar.gz"
+                    tar -czf "${tar_name}" "${source_file}"
+                    rm "./${source_file}" "./build_info.md"
+                    log_info "构建成功: $(basename "${tar_name}")"
+                else
+                    log_error "构建失败: 找不到输出文件 ${source_file}"
+                    return 1
+                fi
+            else
+                log_error "Docker构建失败: $cross_host"
+                return 1
+            fi
+        }
+        
+        # 主函数
+        main() {
+            log_info "开始交叉编译构建..."
+            
+            # 创建输出目录
+            mkdir -p "${DIST_DIR}"
+            
+            # 定义构建目标数组 (交叉编译目标:输出文件名:源文件名)
+            declare -a targets=(
+                "i686-unknown-linux-musl:aria2c_linux_386:aria2c"
+                "x86_64-unknown-linux-musl:aria2c_linux_amd64:aria2c"
+                "arm-unknown-linux-musleabi:aria2c_linux_arm:aria2c"
+                "aarch64-unknown-linux-musl:aria2c_linux_arm64:aria2c"
+                "mips-unknown-linux-musl:aria2c_linux_mips:aria2c"
+                "mips64-unknown-linux-musl:aria2c_linux_mips64:aria2c"
+                "mips64el-unknown-linux-musl:aria2c_linux_mips64le:aria2c"
+                "mipsel-unknown-linux-musl:aria2c_linux_mipsle:aria2c"
+                "i686-w64-mingw32:aria2c_windows_386:aria2c.exe"
+                "x86_64-w64-mingw32:aria2c_windows_amd64:aria2c.exe"
+            )
+            
+            local failed_builds=0
+            local total_builds=${#targets[@]}
+            
+            # 顺序构建
+            for target in "${targets[@]}"; do
+                IFS=':' read -r cross_host output_name source_file <<< "$target"
+                
+                if ! build_target "$cross_host" "$output_name" "$source_file"; then
+                    ((failed_builds++))
+                    log_error "构建失败: $cross_host"
+                    log_error "遇到错误，停止构建"
+                    exit 1
+                fi
+            done
+            
+            # 构建结果汇总
+            local success_builds=$((total_builds - failed_builds))
+            log_info "构建完成!"
+            log_info "总计: $total_builds, 成功: $success_builds, 失败: $failed_builds"
+            
+            if [[ $failed_builds -gt 0 ]]; then
+                log_warn "存在失败的构建，请检查日志"
+                exit 1
+            fi
+            
+            # 显示输出文件
+            log_info "输出文件列表:"
+            ls -la "${DIST_DIR}/"
+        }
+        
+        # 执行主函数
+        main "$@"
+        SCRIPT_EOF
+        
+        chmod +x cross_build.sh
+    
+    - name: Execute build script
+      run: |
+        cd aria2-static-build
+        ./cross_build.sh
+    
+    - name: Check build results
+      run: |
+        cd aria2-static-build
+        echo "Build results:"
+        ls -la dist/
+        echo "File sizes:"
+        du -h dist/*
+    
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: aria2-static-binaries
+        path: aria2-static-build/dist/
+        retention-days: 30
