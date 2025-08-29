@@ -54,7 +54,7 @@ jobs:
 
         # 在build_aria2函数的make install后添加strip命令
         sed -i '/^  \.\/configure.*ARIA2_STATIC=yes$/,/^  make install$/{
-          /^  make install$/a\  strip "${CROSS_PREFIX}/bin/aria2c"
+          /^  make install$/a\  "${CROSS_HOST}-strip" "${CROSS_PREFIX}/bin/aria2c"
         }' build.sh
 
         # 配置
