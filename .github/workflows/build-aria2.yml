@@ -46,6 +46,17 @@ jobs:
           fi
         EOF
         
+        # 修改全局CFLAGS设置
+        sed -i 's/export CFLAGS="-I${CROSS_PREFIX}\/include"/export CFLAGS="-Os -s -I${CROSS_PREFIX}\/include"/' build.sh
+
+        # 修改build_aria2函数中的configure命令
+        sed -i '/^  \.\/configure --host="${CROSS_HOST}" --prefix="${CROSS_PREFIX}" --enable-static --disable-shared --enable-silent-rules ARIA2_STATIC=yes$/c\  ./configure CFLAGS="-Os -s" --host="${CROSS_HOST}" --prefix="${CROSS_PREFIX}" --enable-static --disable-shared --enable-silent-rules ARIA2_STATIC=yes' build.sh
+
+        # 在build_aria2函数的make install后添加strip命令
+        sed -i '/^  \.\/configure.*ARIA2_STATIC=yes$/,/^  make install$/{
+          /^  make install$/a\  strip "${CROSS_PREFIX}/bin/aria2c"
+        }' build.sh
+
         # 配置
         DOCKER_IMAGE="abcfy2/musl-cross-toolchain-ubuntu"
         BUILD_SCRIPT="/build/build.sh"
